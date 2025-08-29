@@ -568,10 +568,60 @@ class YOLOService:
         
         return person_statuses
     
-    def _draw_annotations(self, image: np.ndarray, person_statuses: List[Dict]) -> np.ndarray:
+    def _draw_ppe_boxes(self, image: np.ndarray, detections_by_class: Dict[str, List[Dict]]):
+        """Draw bounding boxes for individual PPE items."""
+        # Define colors for different PPE items
+        ppe_colors = {
+            'Helmet': (0, 255, 255),      # Yellow
+            'Vest': (255, 165, 0),        # Orange  
+            'Gloves': (255, 0, 255),      # Magenta
+            'Goggles': (0, 255, 0),       # Green
+            'Earplug': (255, 255, 0),     # Cyan
+            'Mask': (128, 0, 128),        # Purple
+            'Shoes': (165, 42, 42)        # Brown
+        }
+        
+        for ppe_class, detections in detections_by_class.items():
+            if ppe_class == 'Person' or not detections:  # Skip person class
+                continue
+                
+            color = ppe_colors.get(ppe_class, (255, 255, 255))  # Default white
+            
+            for detection in detections:
+                bbox = detection['bbox']
+                x1, y1, x2, y2 = [int(coord) for coord in bbox]
+                confidence = detection['confidence']
+                
+                # Draw PPE bounding box with thinner lines
+                cv2.rectangle(image, (x1, y1), (x2, y2), color, 1)
+                
+                # Draw small label for PPE item
+                label = f"{ppe_class} {confidence:.2f}"
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.4
+                thickness = 1
+                
+                (label_width, label_height), _ = cv2.getTextSize(label, font, font_scale, thickness)
+                
+                # Draw label background
+                cv2.rectangle(image, 
+                            (x1, y1 - label_height - 5),
+                            (x1 + label_width + 5, y1),
+                            color, -1)
+                
+                # Draw label text
+                cv2.putText(image, label, (x1 + 2, y1 - 2),
+                          font, font_scale, (0, 0, 0), thickness)  # Black text
+    
+    def _draw_annotations(self, image: np.ndarray, person_statuses: List[Dict], detections_by_class: Dict[str, List[Dict]] = None) -> np.ndarray:
         """Draw bounding boxes and labels on the image."""
         annotated_image = image.copy()
         
+        # First, draw individual PPE item bounding boxes if detections are provided
+        if detections_by_class:
+            self._draw_ppe_boxes(annotated_image, detections_by_class)
+        
+        # Then draw person bounding boxes and labels
         for i, person in enumerate(person_statuses):
             bbox = person['bbox']
             x1, y1, x2, y2 = [int(coord) for coord in bbox]
@@ -643,9 +693,13 @@ class YOLOService:
         return annotated_image
     
     def _draw_video_annotations(self, image: np.ndarray, tracked_people: List[Dict], 
-                               frame_number: int, total_frames: int) -> np.ndarray:
+                               frame_number: int, total_frames: int, detections_by_class: Dict[str, List[Dict]] = None) -> np.ndarray:
         """Draw enhanced annotations for video with tracking info."""
         annotated_image = image.copy()
+        
+        # First, draw individual PPE item bounding boxes if detections are provided
+        if detections_by_class:
+            self._draw_ppe_boxes(annotated_image, detections_by_class)
         
         # Draw frame info
         frame_text = f"Frame: {frame_number}/{total_frames}"
@@ -760,7 +814,7 @@ class YOLOService:
         person_statuses = self.associate_ppe(detections_by_class, required_ppe)
         
         # Draw annotations
-        annotated_image = self._draw_annotations(image_np, person_statuses)
+        annotated_image = self._draw_annotations(image_np, person_statuses, detections_by_class)
         
         # Convert back to bytes
         annotated_pil = Image.fromarray(annotated_image)
@@ -880,7 +934,7 @@ class YOLOService:
                         print(f"Frame {frame_count}: No detections, tracker returned {len(tracked_people)} tracked people")
                 
                 # Draw annotations with frame info using tracked people
-                annotated_frame = self._draw_video_annotations(frame, tracked_people, frame_count, total_frames)
+                annotated_frame = self._draw_video_annotations(frame, tracked_people, frame_count, total_frames, detections_by_class)
                 
                 # Track frame statistics 
                 current_people_count = len([p for p in tracked_people if not p.get('interpolated', False)])
@@ -1021,7 +1075,7 @@ class YOLOService:
         person_statuses = self.associate_ppe(detections_by_class, required_ppe)
         
         # Draw annotations
-        annotated_frame = self._draw_annotations(frame, person_statuses)
+        annotated_frame = self._draw_annotations(frame, person_statuses, detections_by_class)
         
         # Prepare response JSON
         response_json = {
