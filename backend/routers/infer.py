@@ -4,7 +4,7 @@ FastAPI inference router for PPE compliance detection.
 import os
 import tempfile
 import traceback
-from typing import Optional
+from typing import Optional, List
 from fastapi import APIRouter, UploadFile, File, Query, HTTPException
 from fastapi.responses import Response, StreamingResponse, FileResponse
 import cv2
@@ -22,7 +22,8 @@ async def infer_image(
     confidence_threshold: float = Query(0.25, ge=0.0, le=1.0),
     iou_threshold: float = Query(0.45, ge=0.0, le=1.0),
     save_outputs: bool = Query(False),
-    output_dir: str = Query("outputs")
+    output_dir: str = Query("outputs"),
+    required_ppe: Optional[str] = Query(None, description="Comma-separated list of required PPE items (e.g., 'Helmet,Vest,Gloves')")
 ):
     """
     Run PPE compliance inference on uploaded image.
@@ -45,13 +46,19 @@ async def infer_image(
         except Exception as img_error:
             raise HTTPException(status_code=400, detail=f"Invalid image file: {str(img_error)}")
         
+        # Parse required PPE
+        required_ppe_list = None
+        if required_ppe:
+            required_ppe_list = [item.strip() for item in required_ppe.split(',')]
+        
         # Run inference
         annotated_bytes, result_json = yolo_service.infer_image(
             image_bytes=image_bytes,
             conf_threshold=confidence_threshold,
             iou_threshold=iou_threshold,
             save_outputs=save_outputs,
-            output_dir=output_dir
+            output_dir=output_dir,
+            required_ppe=required_ppe_list
         )
         
         # Return JSON response with image data
@@ -78,7 +85,8 @@ async def infer_video(
     iou_threshold: float = Query(0.45, ge=0.0, le=1.0),
     save_outputs: bool = Query(True),
     output_dir: str = Query("outputs"),
-    download_video: bool = Query(False, description="Return processed video file for download")
+    download_video: bool = Query(False, description="Return processed video file for download"),
+    required_ppe: Optional[str] = Query(None, description="Comma-separated list of required PPE items (e.g., 'Helmet,Vest,Gloves')")
 ):
     """
     Run PPE compliance inference on uploaded video.
@@ -97,13 +105,19 @@ async def infer_video(
             temp_video_path = temp_file.name
         
         try:
+            # Parse required PPE
+            required_ppe_list = None
+            if required_ppe:
+                required_ppe_list = [item.strip() for item in required_ppe.split(',')]
+            
             # Run inference
             output_video_path, result_json = yolo_service.infer_video(
                 video_path=temp_video_path,
                 conf_threshold=confidence_threshold,
                 iou_threshold=iou_threshold,
                 save_outputs=save_outputs,
-                output_dir=output_dir
+                output_dir=output_dir,
+                required_ppe=required_ppe_list
             )
             
             # Return video file for download if requested
@@ -155,7 +169,8 @@ async def download_processed_video(filename: str, output_dir: str = Query("outpu
 async def stream_webcam(
     confidence_threshold: float = Query(0.25, ge=0.0, le=1.0),
     iou_threshold: float = Query(0.45, ge=0.0, le=1.0),
-    camera_index: int = Query(0)
+    camera_index: int = Query(0),
+    required_ppe: Optional[str] = Query(None, description="Comma-separated list of required PPE items (e.g., 'Helmet,Vest,Gloves')")
 ):
     """
     Stream MJPEG from webcam with real-time PPE compliance detection.
@@ -164,6 +179,11 @@ async def stream_webcam(
         cap = cv2.VideoCapture(camera_index)
         if not cap.isOpened():
             raise HTTPException(status_code=500, detail="Could not access webcam")
+        
+        # Parse required PPE
+        required_ppe_list = None
+        if required_ppe:
+            required_ppe_list = [item.strip() for item in required_ppe.split(',')]
         
         try:
             while True:
@@ -175,7 +195,8 @@ async def stream_webcam(
                 annotated_frame, result_json = yolo_service.infer_frame(
                     frame=frame,
                     conf_threshold=confidence_threshold,
-                    iou_threshold=iou_threshold
+                    iou_threshold=iou_threshold,
+                    required_ppe=required_ppe_list
                 )
                 
                 # Encode frame as JPEG

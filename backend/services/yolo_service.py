@@ -25,6 +25,7 @@ class Track:
         self.status = initial_status.get('status', 'Unknown')
         self.has_helmet = initial_status.get('has_helmet', False)
         self.has_vest = initial_status.get('has_vest', False)
+        self.ppe_detected = initial_status.get('ppe_detected', {})
         
         # Track lifecycle state management
         self.state = 'tentative'  # tentative -> confirmed -> lost -> deleted
@@ -127,6 +128,7 @@ class Track:
         self.status = detection.get('status', 'Unknown')
         self.has_helmet = detection.get('has_helmet', False)
         self.has_vest = detection.get('has_vest', False)
+        self.ppe_detected = detection.get('ppe_detected', {})
         
         # Track lifecycle management
         self.time_since_update = 0
@@ -420,8 +422,10 @@ class YOLOService:
         self.model_path = model_path
         self.model = None
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.class_names = ['Person', 'Helmet', 'Vest']
-        self.target_classes = ['Person', 'Helmet', 'Vest']
+        # Dataset classes according to user specification
+        self.all_class_names = ['Earplug', 'Gloves', 'Goggles', 'Helmet', 'Mask', 'Person', 'Shoes', 'Vest']
+        self.class_names = []  # Will be populated from model
+        self.target_classes = []  # Will be populated from model
         self.load_model()
         
         # Initialize tracker as None - will be created when needed for video
@@ -443,20 +447,9 @@ class YOLOService:
             else:
                 print(f"Using default class names: {self.class_names}")
             
-            # Update target classes to match actual model classes
-            # Look for Person/People, Helmet/Hard-hat, Vest/Safety-vest variations
-            target_mapping = {
-                'Person': ['Person', 'person', 'People', 'people'],
-                'Helmet': ['Helmet', 'helmet', 'Hard-hat', 'hard-hat', 'Hardhat', 'hardhat'],
-                'Vest': ['Vest', 'vest', 'Safety-vest', 'safety-vest', 'Safetyvest', 'safetyvest']
-            }
-            
-            self.target_classes = []
-            for target, variations in target_mapping.items():
-                for variation in variations:
-                    if variation in self.class_names:
-                        self.target_classes.append(variation)
-                        break
+            # Update target classes to include all PPE items from the model
+            # All classes except Person are PPE items
+            self.target_classes = self.class_names.copy()
             
             print(f"Target classes found in model: {self.target_classes}")
             print(f"Model loaded on {self.device}: {self.model_path}")
@@ -465,9 +458,18 @@ class YOLOService:
             print(f"Failed to load model: {e}")
             raise
     
-    def _parse_detections(self, results, debug=False) -> Tuple[List[Dict], List[Dict], List[Dict]]:
-        """Parse YOLO results into persons, helmets, and vests."""
-        persons, helmets, vests = [], [], []
+    def _parse_detections(self, results, debug=False) -> Dict[str, List[Dict]]:
+        """Parse YOLO results into categorized detections."""
+        detections_by_class = {
+            'Person': [],
+            'Helmet': [],
+            'Vest': [],
+            'Earplug': [],
+            'Gloves': [],
+            'Goggles': [],
+            'Mask': [],
+            'Shoes': []
+        }
         total_detections = 0
         
         for result in results:
@@ -502,61 +504,64 @@ class YOLOService:
                         'class_id': class_id
                     }
                     
-                    # Categorize by class (check for different variations)
-                    if class_name.lower() in ['person', 'people']:
-                        persons.append(detection)
-                    elif class_name.lower() in ['helmet', 'hard-hat', 'hardhat']:
-                        helmets.append(detection)
-                    elif class_name.lower() in ['vest', 'safety-vest', 'safetyvest']:
-                        vests.append(detection)
+                    # Categorize by class name
+                    if class_name in detections_by_class:
+                        detections_by_class[class_name].append(detection)
             else:
                 if debug:
                     print("No boxes detected by YOLO")
         
         if debug:
             print(f"Total YOLO detections: {total_detections}")
-            print(f"Parsed: {len(persons)} persons, {len(helmets)} helmets, {len(vests)} vests")
+            for class_name, dets in detections_by_class.items():
+                if dets:
+                    print(f"Parsed: {len(dets)} {class_name}(s)")
         
-        return persons, helmets, vests
+        return detections_by_class
     
-    def associate_ppe(self, persons: List[Dict], helmets: List[Dict], vests: List[Dict]) -> List[Dict]:
+    def associate_ppe(self, detections_by_class: Dict[str, List[Dict]], 
+                     required_ppe: List[str] = None) -> List[Dict]:
         """Associate PPE items with persons and determine safety compliance."""
         person_statuses = []
+        persons = detections_by_class.get('Person', [])
         
         for person in persons:
             person_bbox = person['bbox']
+            ppe_detected = {}
             
-            # Check for helmet within person bounding box
-            has_helmet = False
-            for helmet in helmets:
-                helmet_bbox = helmet['bbox']
-                containment_ratio = calculate_containment_ratio(helmet_bbox, person_bbox)
+            # Check each PPE type for containment within person bounding box
+            for ppe_class in ['Helmet', 'Vest', 'Gloves', 'Goggles', 'Earplug', 'Mask', 'Shoes']:
+                has_ppe = False
+                ppe_items = detections_by_class.get(ppe_class, [])
                 
-                # Helmet is associated if significantly contained within person bbox
-                if containment_ratio > 0.3:  # 30% containment threshold
-                    has_helmet = True
-                    break
-            
-            # Check for vest within person bounding box
-            has_vest = False
-            for vest in vests:
-                vest_bbox = vest['bbox']
-                containment_ratio = calculate_containment_ratio(vest_bbox, person_bbox)
+                for ppe_item in ppe_items:
+                    ppe_bbox = ppe_item['bbox']
+                    containment_ratio = calculate_containment_ratio(ppe_bbox, person_bbox)
+                    
+                    # PPE is associated if significantly contained within person bbox
+                    if containment_ratio > 0.3:  # 30% containment threshold
+                        has_ppe = True
+                        break
                 
-                # Vest is associated if significantly contained within person bbox
-                if containment_ratio > 0.3:  # 30% containment threshold
-                    has_vest = True
-                    break
+                ppe_detected[ppe_class] = has_ppe
             
-            # Determine compliance status
-            status = "Safe" if (has_helmet and has_vest) else "Unsafe"
+            # Determine compliance status based on required PPE
+            if required_ppe is None or len(required_ppe) == 0:
+                # Default behavior - require helmet and vest
+                status = "Safe" if (ppe_detected.get('Helmet', False) and ppe_detected.get('Vest', False)) else "Unsafe"
+            else:
+                # Check if all required PPE items are present
+                all_required_present = all(ppe_detected.get(ppe, False) for ppe in required_ppe)
+                status = "Safe" if all_required_present else "Unsafe"
             
             person_status = {
                 'bbox': person_bbox,
                 'confidence': person['confidence'],
                 'status': status,
-                'has_helmet': has_helmet,
-                'has_vest': has_vest
+                'ppe_detected': ppe_detected,
+                # Keep backward compatibility
+                'has_helmet': ppe_detected.get('Helmet', False),
+                'has_vest': ppe_detected.get('Vest', False)
             }
             
             person_statuses.append(person_status)
@@ -584,10 +589,17 @@ class YOLOService:
             # Draw bounding box
             cv2.rectangle(annotated_image, (x1, y1), (x2, y2), color, 2)
             
-            # Prepare label
+            # Prepare label with dynamic PPE status
             label = f"Person {i+1}: {status}"
             confidence_label = f"Conf: {confidence:.2f}"
-            ppe_status = f"H:{'✓' if person.get('has_helmet') else '✗'} V:{'✓' if person.get('has_vest') else '✗'}"
+            
+            # Build PPE status string dynamically
+            ppe_detected = person.get('ppe_detected', {})
+            ppe_items = []
+            for ppe, symbol in [('Helmet', 'H'), ('Vest', 'V'), ('Gloves', 'G'), ('Goggles', 'Gg'), ('Earplug', 'E'), ('Mask', 'M'), ('Shoes', 'S')]:
+                has_ppe = ppe_detected.get(ppe, False)
+                ppe_items.append(f"{symbol}:{'✓' if has_ppe else '✗'}")
+            ppe_status = " ".join(ppe_items)
             
             # Calculate text sizes
             font = cv2.FONT_HERSHEY_SIMPLEX
@@ -668,11 +680,18 @@ class YOLOService:
             # Draw bounding box
             cv2.rectangle(annotated_image, (x1, y1), (x2, y2), color, thickness)
             
-            # Prepare enhanced label with person ID
+            # Prepare enhanced label with person ID and dynamic PPE status
             person_id = person.get('person_id', i+1)
             label = f"Person {person_id}: {status}"
             confidence_label = f"Conf: {confidence:.2f}"
-            ppe_status = f"H:{'✓' if person.get('has_helmet') else '✗'} V:{'✓' if person.get('has_vest') else '✗'}"
+            
+            # Build PPE status string dynamically
+            ppe_detected = person.get('ppe_detected', {})
+            ppe_items = []
+            for ppe, symbol in [('Helmet', 'H'), ('Vest', 'V'), ('Gloves', 'G'), ('Goggles', 'Gg'), ('Earplug', 'E'), ('Mask', 'M'), ('Shoes', 'S')]:
+                has_ppe = ppe_detected.get(ppe, False)
+                ppe_items.append(f"{symbol}:{'✓' if has_ppe else '✗'}")
+            ppe_status = " ".join(ppe_items)
             
             # Calculate text sizes
             font = cv2.FONT_HERSHEY_SIMPLEX
@@ -722,7 +741,8 @@ class YOLOService:
                    conf_threshold: float = 0.25,
                    iou_threshold: float = 0.45,
                    save_outputs: bool = False,
-                   output_dir: str = "outputs") -> Tuple[bytes, Dict]:
+                   output_dir: str = "outputs",
+                   required_ppe: List[str] = None) -> Tuple[bytes, Dict]:
         """
         Run inference on image and return annotated image bytes and results.
         """
@@ -734,10 +754,10 @@ class YOLOService:
         results = self.model(image_np, conf=conf_threshold, iou=iou_threshold, verbose=False)
         
         # Parse detections
-        persons, helmets, vests = self._parse_detections(results)
+        detections_by_class = self._parse_detections(results)
         
         # Associate PPE with persons
-        person_statuses = self.associate_ppe(persons, helmets, vests)
+        person_statuses = self.associate_ppe(detections_by_class, required_ppe)
         
         # Draw annotations
         annotated_image = self._draw_annotations(image_np, person_statuses)
@@ -776,7 +796,8 @@ class YOLOService:
                    conf_threshold: float = 0.25,
                    iou_threshold: float = 0.45,
                    save_outputs: bool = True,
-                   output_dir: str = "outputs") -> Tuple[Optional[str], Dict]:
+                   output_dir: str = "outputs",
+                   required_ppe: List[str] = None) -> Tuple[Optional[str], Dict]:
         """
         Run inference on video and return output video path and results.
         Enhanced with better frame processing and statistics.
@@ -833,14 +854,15 @@ class YOLOService:
                 
                 # Parse detections with debug info on first few frames
                 debug_this_frame = frame_count <= 3 or frame_count % 30 == 0
-                persons, helmets, vests = self._parse_detections(results, debug=debug_this_frame)
+                detections_by_class = self._parse_detections(results, debug=debug_this_frame)
                 
                 # Debug: Log detection counts every 30 frames
                 if frame_count % 30 == 0:
-                    print(f"Frame {frame_count}: Found {len(persons)} persons, {len(helmets)} helmets, {len(vests)} vests")
+                    persons_count = len(detections_by_class.get('Person', []))
+                    print(f"Frame {frame_count}: Found {persons_count} persons")
                 
                 # Associate PPE with persons
-                person_statuses = self.associate_ppe(persons, helmets, vests)
+                person_statuses = self.associate_ppe(detections_by_class, required_ppe)
                 
                 # Debug: Log person statuses
                 if frame_count % 30 == 0 and person_statuses:
@@ -931,6 +953,7 @@ class YOLOService:
                 'status': track.status,
                 'has_helmet': track.has_helmet,
                 'has_vest': track.has_vest,
+                'ppe_detected': track.ppe_detected,  # Include full PPE detection info
                 'tracking_stats': {
                     'total_appearances': track.total_appearances,
                     'safe_appearances': track.safe_count,
@@ -984,7 +1007,7 @@ class YOLOService:
         
         return output_path, response_json
     
-    def infer_frame(self, frame: np.ndarray, conf_threshold: float = 0.25, iou_threshold: float = 0.45) -> Tuple[np.ndarray, Dict]:
+    def infer_frame(self, frame: np.ndarray, conf_threshold: float = 0.25, iou_threshold: float = 0.45, required_ppe: List[str] = None) -> Tuple[np.ndarray, Dict]:
         """
         Run inference on a single frame (for webcam streaming).
         """
@@ -992,10 +1015,10 @@ class YOLOService:
         results = self.model(frame, conf=conf_threshold, iou=iou_threshold, verbose=False)
         
         # Parse detections
-        persons, helmets, vests = self._parse_detections(results)
+        detections_by_class = self._parse_detections(results)
         
         # Associate PPE with persons
-        person_statuses = self.associate_ppe(persons, helmets, vests)
+        person_statuses = self.associate_ppe(detections_by_class, required_ppe)
         
         # Draw annotations
         annotated_frame = self._draw_annotations(frame, person_statuses)

@@ -26,31 +26,53 @@ def main():
         layout="wide"
     )
     
-    st.title("🦺 PPE Compliance Detection")
-    st.markdown("YOLOv8-based safety compliance monitoring for Person, Helmet, and Vest detection")
+    st.title("SS -Suite: 🦺 PPE Compliance Detection")
+    # st.markdown("YOLOv8-based safety compliance monitoring for Person, Helmet, and Vest detection")
     
     # Sidebar for global settings
     with st.sidebar:
-        st.header("⚙️ Model Settings")
+        # st.header("⚙️ Model Settings")
         
         # Model configuration
-        confidence_threshold = st.slider("Confidence Threshold", 0.0, 1.0, 0.25, 0.05)
-        iou_threshold = st.slider("IoU Threshold", 0.0, 1.0, 0.45, 0.05)
-        save_outputs = st.checkbox("Save Outputs", value=False)
-        output_dir = st.text_input("Output Directory", value="outputs")
+        # confidence_threshold = st.slider("Confidence Threshold", 0.0, 1.0, 0.25, 0.05)
+        # iou_threshold = st.slider("IoU Threshold", 0.0, 1.0, 0.45, 0.05)
+        # save_outputs = st.checkbox("Save Outputs", value=False)
+        # output_dir = st.text_input("Output Directory", value="outputs")
+        
+        st.header("🦺 PPE Compliance Settings")
+        st.markdown("Select which PPE items are required for compliance:")
+        
+        # Available PPE classes based on the model
+        available_ppe = ['Helmet', 'Vest', 'Gloves', 'Goggles', 'Earplug', 'Mask', 'Shoes']
+        
+        # Default selection (Helmet and Vest)
+        default_ppe = ['Helmet', 'Vest']
+        
+        required_ppe = st.multiselect(
+            "Required PPE Items",
+            available_ppe,
+            default=default_ppe,
+            help="Select PPE items that must be worn for a person to be considered 'Safe'"
+        )
+        
+        # Show compliance rule
+        if required_ppe:
+            st.info(f"**Compliance Rule:** A person is 'Safe' if wearing **ALL** of: {', '.join(required_ppe)}")
+        else:
+            st.warning("**No PPE requirements selected!** All persons will be marked as 'Safe'")
         
         # Model info
-        st.header("📊 Model Info")
-        if st.button("Get Model Info"):
-            try:
-                response = requests.get(f"{API_BASE_URL}/infer/model/info")
-                if response.status_code == 200:
-                    model_info = response.json()
-                    st.json(model_info)
-                else:
-                    st.error(f"Error: {response.status_code}")
-            except Exception as e:
-                st.error(f"Failed to connect to API: {e}")
+        # st.header("📊 Model Info")
+        # if st.button("Get Model Info"):
+        #     try:
+        #         response = requests.get(f"{API_BASE_URL}/infer/model/info")
+        #         if response.status_code == 200:
+        #             model_info = response.json()
+        #             st.json(model_info)
+        #         else:
+        #             st.error(f"Error: {response.status_code}")
+        #     except Exception as e:
+        #         st.error(f"Failed to connect to API: {e}")
         
         # Health check
         st.header("🏥 Health Check")
@@ -61,29 +83,34 @@ def main():
                     health = response.json()
                     if health.get("status") == "healthy":
                         st.success("API is healthy ✅")
-                        st.json(health)
+                        # st.json(health)
                     else:
                         st.warning("API is unhealthy ⚠️")
-                        st.json(health)
+                        # st.json(health)
                 else:
                     st.error("API is down ❌")
             except Exception as e:
                 st.error(f"Failed to connect to API: {e}")
     
     # Main content tabs
-    tab1, tab2, tab3 = st.tabs(["📸 Image Inference", "🎬 Video Inference", "📹 Live Webcam"])
+    # tab1, tab2, tab3 = st.tabs(["📸 Image Inference", "🎬 Video Inference", "📹 Live Webcam"])
+    tab1, tab2= st.tabs(["📸 Image Inference", "🎬 Video Inference"])
+    confidence_threshold = 0.25
+    iou_threshold = 0.45
+    save_outputs = False
+    output_dir = "outputs"
     
     with tab1:
-        handle_image_inference(confidence_threshold, iou_threshold, save_outputs, output_dir)
+        handle_image_inference(confidence_threshold, iou_threshold, save_outputs, output_dir, required_ppe)
     
     with tab2:
-        handle_video_inference(confidence_threshold, iou_threshold, save_outputs, output_dir)
+        handle_video_inference(confidence_threshold, iou_threshold, save_outputs, output_dir, required_ppe)
     
-    with tab3:
-        handle_webcam_inference(confidence_threshold, iou_threshold)
+    # with tab3:
+    #     handle_webcam_inference(confidence_threshold, iou_threshold)
 
 
-def handle_image_inference(conf_threshold, iou_threshold, save_outputs, output_dir):
+def handle_image_inference(conf_threshold, iou_threshold, save_outputs, output_dir, required_ppe):
     """Handle image inference tab."""
     st.header("Upload Image for PPE Detection")
     
@@ -114,6 +141,10 @@ def handle_image_inference(conf_threshold, iou_threshold, save_outputs, output_d
                         "save_outputs": save_outputs,
                         "output_dir": output_dir
                     }
+                    
+                    # Add required PPE if specified
+                    if required_ppe:
+                        params["required_ppe"] = ",".join(required_ppe)
                     
                     # Make API call
                     response = requests.post(
@@ -150,7 +181,7 @@ def handle_image_inference(conf_threshold, iou_threshold, save_outputs, output_d
                     st.error(f"Error: {e}")
 
 
-def handle_video_inference(conf_threshold, iou_threshold, save_outputs, output_dir):
+def handle_video_inference(conf_threshold, iou_threshold, save_outputs, output_dir, required_ppe):
     """Handle video inference tab."""
     st.header("Upload Video for PPE Detection")
     
@@ -165,14 +196,10 @@ def handle_video_inference(conf_threshold, iou_threshold, save_outputs, output_d
         st.subheader("Original Video")
         st.video(uploaded_file)
         
-        # Video processing options
-        col1, col2 = st.columns(2)
-        with col1:
-            process_only = st.button("🔍 Process Video (JSON Only)", key="video_inference_json")
-        with col2:
-            process_and_download = st.button("🔍 Process & Download Video", key="video_inference_download")
+        # Video processing option
+        process_and_download = st.button("🔍 Process Video", key="video_inference_download")
         
-        if process_only or process_and_download:
+        if process_and_download:
             with st.spinner("Processing video... This may take a while."):
                 try:
                     # Prepare API request
@@ -182,8 +209,12 @@ def handle_video_inference(conf_threshold, iou_threshold, save_outputs, output_d
                         "iou_threshold": iou_threshold,
                         "save_outputs": True,  # Always save for video
                         "output_dir": output_dir,
-                        "download_video": process_and_download
+                        "download_video": True  # Always download video
                     }
+                    
+                    # Add required PPE if specified
+                    if required_ppe:
+                        params["required_ppe"] = ",".join(required_ppe)
                     
                     # Make API call
                     response = requests.post(
@@ -194,43 +225,28 @@ def handle_video_inference(conf_threshold, iou_threshold, save_outputs, output_d
                     )
                     
                     if response.status_code == 200:
-                        if process_and_download:
-                            # Handle video file download
-                            if 'application/json' in response.headers.get('content-type', ''):
-                                # JSON response (no video download)
-                                result_json = response.json()
-                                display_results(result_json)
-                                st.warning("Video processing completed but no video file was returned.")
-                            else:
-                                # Video file response
-                                result_json_header = response.headers.get('X-Result-JSON')
-                                if result_json_header:
-                                    result_json = json.loads(result_json_header)
-                                    display_results(result_json)
-                                
-                                # Provide video download
-                                st.subheader("📥 Processed Video")
-                                st.success("Video processing completed!")
-                                st.download_button(
-                                    label="📥 Download Processed Video",
-                                    data=response.content,
-                                    file_name="ppe_detection_result.mp4",
-                                    mime="video/mp4"
-                                )
-                        else:
-                            # JSON only response
+                        # Handle video file download
+                        if 'application/json' in response.headers.get('content-type', ''):
+                            # JSON response (no video download)
                             result_json = response.json()
                             display_results(result_json)
+                            st.warning("Video processing completed but no video file was returned.")
+                        else:
+                            # Video file response
+                            result_json_header = response.headers.get('X-Result-JSON')
+                            if result_json_header:
+                                result_json = json.loads(result_json_header)
+                                display_results(result_json)
                             
-                            # Show output video path if available
-                            if "output_path" in result_json and result_json["output_path"]:
-                                st.subheader("Processed Video")
-                                st.success(f"Video saved to: {result_json['output_path']}")
-                                
-                                # Optional: Try to show download link
-                                filename = os.path.basename(result_json["output_path"])
-                                download_url = f"{API_BASE_URL}/infer/video/download/{filename}?output_dir={output_dir}"
-                                st.markdown(f"🔗 [Download Processed Video]({download_url})")
+                            # Provide video download
+                            st.subheader("📥 Processed Video")
+                            st.success("Video processing completed!")
+                            st.download_button(
+                                label="📥 Download Processed Video",
+                                data=response.content,
+                                file_name="ppe_detection_result.mp4",
+                                mime="video/mp4"
+                            )
                         
                     else:
                         st.error(f"API Error: {response.status_code} - {response.text}")
@@ -327,30 +343,36 @@ def display_results(result_json):
         # Create DataFrame for better display
         person_data = []
         for i, person in enumerate(people):
+            # Get PPE detected info
+            ppe_detected = person.get('ppe_detected', {})
+            
             # Check if this is tracked person data (video) or regular detection (image)
             if 'tracking_stats' in person:
                 # Video tracking data
                 tracking = person['tracking_stats']
-                person_data.append({
+                person_row = {
                     "Person": f"Person {person.get('person_id', i+1)}",
                     "Status": person.get("status", "Unknown"),
                     "Confidence": f"{person.get('confidence', 0):.3f}",
-                    "Has Helmet": "✅" if person.get("has_helmet", False) else "❌",
-                    "Has Vest": "✅" if person.get("has_vest", False) else "❌",
                     "Appearances": f"{tracking['total_appearances']}",
                     "Safety %": f"{tracking['safety_percentage']}%",
                     "Frames": f"{tracking['first_seen_frame']}-{tracking['last_seen_frame']}"
-                })
+                }
             else:
                 # Regular image detection
-                person_data.append({
+                person_row = {
                     "Person": f"Person {i+1}",
                     "Status": person.get("status", "Unknown"),
                     "Confidence": f"{person.get('confidence', 0):.3f}",
-                    "Has Helmet": "✅" if person.get("has_helmet", False) else "❌",
-                    "Has Vest": "✅" if person.get("has_vest", False) else "❌",
                     "Bounding Box": f"[{', '.join(map(lambda x: f'{x:.1f}', person.get('bbox', [])))}]"
-                })
+                }
+            
+            # Add PPE columns dynamically
+            for ppe_item in ['Helmet', 'Vest', 'Gloves', 'Goggles', 'Earplug', 'Mask', 'Shoes']:
+                has_ppe = ppe_detected.get(ppe_item, False)
+                person_row[ppe_item] = "✅" if has_ppe else "❌"
+            
+            person_data.append(person_row)
         
         df = pd.DataFrame(person_data)
         
@@ -363,43 +385,43 @@ def display_results(result_json):
         st.dataframe(styled_df, use_container_width=True)
     
     # Video-specific information
-    if "video_info" in result_json:
-        st.subheader("🎬 Video Information")
-        video_info = result_json["video_info"]
+    # if "video_info" in result_json:
+    #     st.subheader("🎬 Video Information")
+    #     video_info = result_json["video_info"]
         
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Total Frames", video_info.get("total_frames", 0))
-        with col2:
-            st.metric("Processed Frames", video_info.get("processed_frames", 0))
-        with col3:
-            st.metric("FPS", video_info.get("fps", 0))
-        with col4:
-            duration = video_info.get("duration_seconds", 0)
-            st.metric("Duration", f"{duration:.1f}s")
+    #     col1, col2, col3, col4 = st.columns(4)
+    #     with col1:
+    #         st.metric("Total Frames", video_info.get("total_frames", 0))
+    #     with col2:
+    #         st.metric("Processed Frames", video_info.get("processed_frames", 0))
+    #     with col3:
+    #         st.metric("FPS", video_info.get("fps", 0))
+    #     with col4:
+    #         duration = video_info.get("duration_seconds", 0)
+    #         st.metric("Duration", f"{duration:.1f}s")
         
         # Enhanced analytics
-        if "analytics" in result_json:
-            st.subheader("📊 Video Analytics")
-            analytics = result_json["analytics"]
+        # if "analytics" in result_json:
+        #     st.subheader("📊 Video Analytics")
+        #     analytics = result_json["analytics"]
             
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Unique People", analytics.get("unique_people_detected", 0))
-                st.metric("Total Detections", analytics.get("total_person_detections", 0))
-                st.metric("Avg People/Frame", analytics.get("average_people_per_frame", 0))
-            with col2:
-                safety_rate = analytics.get("safety_compliance_rate", 0)
-                st.metric("Safety Compliance", f"{safety_rate}%", 
-                         delta=f"{'Good' if safety_rate > 80 else 'Needs Improvement'}")
-                st.metric("Frames with Detections", analytics.get("frames_with_detections", 0))
-                st.metric("Max People in Frame", analytics.get("max_people_in_frame", 0))
-            with col3:
-                efficiency = analytics.get("processing_efficiency", 0)
-                st.metric("Processing Efficiency", f"{efficiency}%")
-                tracking_threshold = analytics.get("tracking_threshold", 0)
-                st.metric("Tracking Threshold", f"{tracking_threshold} frames")
-                st.metric("Resolution", video_info.get("resolution", "Unknown"))
+        #     col1, col2, col3 = st.columns(3)
+        #     with col1:
+        #         st.metric("Unique People", analytics.get("unique_people_detected", 0))
+        #         st.metric("Total Detections", analytics.get("total_person_detections", 0))
+        #         st.metric("Avg People/Frame", analytics.get("average_people_per_frame", 0))
+        #     with col2:
+        #         safety_rate = analytics.get("safety_compliance_rate", 0)
+        #         st.metric("Safety Compliance", f"{safety_rate}%", 
+        #                  delta=f"{'Good' if safety_rate > 80 else 'Needs Improvement'}")
+        #         st.metric("Frames with Detections", analytics.get("frames_with_detections", 0))
+        #         st.metric("Max People in Frame", analytics.get("max_people_in_frame", 0))
+        #     with col3:
+        #         efficiency = analytics.get("processing_efficiency", 0)
+        #         st.metric("Processing Efficiency", f"{efficiency}%")
+        #         tracking_threshold = analytics.get("tracking_threshold", 0)
+        #         st.metric("Tracking Threshold", f"{tracking_threshold} frames")
+        #         st.metric("Resolution", video_info.get("resolution", "Unknown"))
 
 
 if __name__ == "__main__":
