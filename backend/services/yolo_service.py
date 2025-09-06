@@ -595,10 +595,13 @@ class YOLOService:
                 # Draw PPE bounding box with thinner lines
                 cv2.rectangle(image, (x1, y1), (x2, y2), color, 1)
                 
-                # Draw small label for PPE item
-                label = f"{ppe_class} {confidence:.2f}"
+                # Draw small label for PPE item - just abbreviation
+                # Map class names to abbreviations
+                ppe_abbrev = {'Helmet': 'H', 'Vest': 'V', 'Gloves': 'G', 'Goggles': 'Gg', 
+                             'Earplug': 'E', 'Mask': 'M', 'Shoes': 'S'}
+                label = ppe_abbrev.get(ppe_class, ppe_class[0])
                 font = cv2.FONT_HERSHEY_SIMPLEX
-                font_scale = 0.4
+                font_scale = 0.35
                 thickness = 1
                 
                 (label_width, label_height), _ = cv2.getTextSize(label, font, font_scale, thickness)
@@ -621,6 +624,15 @@ class YOLOService:
         if detections_by_class:
             self._draw_ppe_boxes(annotated_image, detections_by_class)
         
+        # Draw person count summary
+        total_people = len(person_statuses)
+        safe_count = sum(1 for p in person_statuses if p['status'] == 'Safe')
+        unsafe_count = sum(1 for p in person_statuses if p['status'] == 'Unsafe')
+        
+        count_text = f"People: {total_people} (Safe: {safe_count}, Unsafe: {unsafe_count})"
+        cv2.putText(annotated_image, count_text, (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
         # Then draw person bounding boxes and labels
         for i, person in enumerate(person_statuses):
             bbox = person['bbox']
@@ -639,30 +651,31 @@ class YOLOService:
             # Draw bounding box
             cv2.rectangle(annotated_image, (x1, y1), (x2, y2), color, 2)
             
-            # Prepare label with dynamic PPE status
-            label = f"Person {i+1}: {status}"
-            confidence_label = f"Conf: {confidence:.2f}"
-            
-            # Build PPE status string dynamically
+            # Build PPE status string dynamically - show only detected items
             ppe_detected = person.get('ppe_detected', {})
-            ppe_items = []
+            detected_items = []
             for ppe, symbol in [('Helmet', 'H'), ('Vest', 'V'), ('Gloves', 'G'), ('Goggles', 'Gg'), ('Earplug', 'E'), ('Mask', 'M'), ('Shoes', 'S')]:
-                has_ppe = ppe_detected.get(ppe, False)
-                ppe_items.append(f"{symbol}:{'✓' if has_ppe else '✗'}")
-            ppe_status = " ".join(ppe_items)
+                if ppe_detected.get(ppe, False):
+                    detected_items.append(symbol)
             
-            # Calculate text sizes
+            # Create single simplified label with Person and PPE items
+            if detected_items:
+                label = f"Person: {','.join(detected_items)}"
+            else:
+                # Show status if no specific PPE detected
+                status = person.get('status', 'Unknown')
+                label = f"Person ({status})"
+            
+            # Calculate text size for simplified label - make more readable
             font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.7
-            thickness = 2
+            font_scale = 0.5
+            thickness = 1
             
             (label_width, label_height), _ = cv2.getTextSize(label, font, font_scale, thickness)
-            (conf_width, conf_height), _ = cv2.getTextSize(confidence_label, font, font_scale-0.1, thickness-1)
-            (ppe_width, ppe_height), _ = cv2.getTextSize(ppe_status, font, font_scale-0.1, thickness-1)
             
-            # Draw label background
-            label_bg_height = label_height + conf_height + ppe_height + 20
-            label_bg_width = max(label_width, conf_width, ppe_width) + 20
+            # Draw smaller label background
+            label_bg_height = label_height + 6
+            label_bg_width = label_width + 8
             
             # Ensure label stays within image bounds
             label_x = max(x1, 0)
@@ -673,22 +686,11 @@ class YOLOService:
                          (label_x + label_bg_width, label_y + label_bg_height),
                          bg_color, -1)
             
-            # Draw text
-            text_y = label_y + label_height + 5
+            # Draw simplified text - Person with PPE items
+            text_y = label_y + label_height + 3
             
-            # Main status label
-            cv2.putText(annotated_image, label, (label_x + 5, text_y),
+            cv2.putText(annotated_image, label, (label_x + 4, text_y),
                        font, font_scale, (255, 255, 255), thickness)
-            
-            # Confidence label
-            text_y += conf_height + 5
-            cv2.putText(annotated_image, confidence_label, (label_x + 5, text_y),
-                       font, font_scale-0.1, (200, 200, 200), thickness-1)
-            
-            # PPE status label
-            text_y += ppe_height + 5
-            cv2.putText(annotated_image, ppe_status, (label_x + 5, text_y),
-                       font, font_scale-0.1, (200, 200, 200), thickness-1)
         
         return annotated_image
     
@@ -701,10 +703,22 @@ class YOLOService:
         if detections_by_class:
             self._draw_ppe_boxes(annotated_image, detections_by_class)
         
-        # Draw frame info
+        # Draw frame info with accurate person count
+        total_people = len(tracked_people)
+        real_people = len([p for p in tracked_people if not p.get('interpolated', False)])
+        safe_count = sum(1 for p in tracked_people if p['status'] == 'Safe' and not p.get('interpolated', False))
+        unsafe_count = sum(1 for p in tracked_people if p['status'] == 'Unsafe' and not p.get('interpolated', False))
+        
         frame_text = f"Frame: {frame_number}/{total_frames}"
+        count_text = f"People: {real_people} (Safe: {safe_count}, Unsafe: {unsafe_count})"
+        
+        # Draw frame number
         cv2.putText(annotated_image, frame_text, (10, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Draw people count
+        cv2.putText(annotated_image, count_text, (10, 60),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         for i, person in enumerate(tracked_people):
             bbox = person['bbox']
@@ -734,31 +748,31 @@ class YOLOService:
             # Draw bounding box
             cv2.rectangle(annotated_image, (x1, y1), (x2, y2), color, thickness)
             
-            # Prepare enhanced label with person ID and dynamic PPE status
-            person_id = person.get('person_id', i+1)
-            label = f"Person {person_id}: {status}"
-            confidence_label = f"Conf: {confidence:.2f}"
-            
-            # Build PPE status string dynamically
+            # Build PPE status string dynamically - show only detected items
             ppe_detected = person.get('ppe_detected', {})
-            ppe_items = []
+            detected_items = []
             for ppe, symbol in [('Helmet', 'H'), ('Vest', 'V'), ('Gloves', 'G'), ('Goggles', 'Gg'), ('Earplug', 'E'), ('Mask', 'M'), ('Shoes', 'S')]:
-                has_ppe = ppe_detected.get(ppe, False)
-                ppe_items.append(f"{symbol}:{'✓' if has_ppe else '✗'}")
-            ppe_status = " ".join(ppe_items)
+                if ppe_detected.get(ppe, False):
+                    detected_items.append(symbol)
             
-            # Calculate text sizes
+            # Create single simplified label with Person and PPE items
+            if detected_items:
+                label = f"Person: {','.join(detected_items)}"
+            else:
+                # Show status if no specific PPE detected
+                status = person.get('status', 'Unknown')
+                label = f"Person ({status})"
+            
+            # Calculate text size for simplified label
             font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.7
+            font_scale = 0.6
             thickness_text = 2
             
             (label_width, label_height), _ = cv2.getTextSize(label, font, font_scale, thickness_text)
-            (conf_width, conf_height), _ = cv2.getTextSize(confidence_label, font, font_scale-0.1, thickness_text-1)
-            (ppe_width, ppe_height), _ = cv2.getTextSize(ppe_status, font, font_scale-0.1, thickness_text-1)
             
-            # Draw label background with padding
-            label_bg_height = label_height + conf_height + ppe_height + 20
-            label_bg_width = max(label_width, conf_width, ppe_width) + 20
+            # Draw smaller label background
+            label_bg_height = label_height + 6
+            label_bg_width = label_width + 8
             
             # Ensure label stays within image bounds
             label_x = max(x1, 0)
@@ -769,24 +783,11 @@ class YOLOService:
                          (label_x + label_bg_width, label_y + label_bg_height),
                          bg_color, -1)
             
-            # Draw label text with shadow for better readability
-            text_y = label_y + label_height + 5
+            # Draw simplified text - Person with PPE items
+            text_y = label_y + label_height + 3
             
-            # Main status label
-            cv2.putText(annotated_image, label, (label_x + 5, text_y),
-                       font, font_scale, (0, 0, 0), thickness_text + 1)  # Shadow
-            cv2.putText(annotated_image, label, (label_x + 5, text_y),
-                       font, font_scale, (255, 255, 255), thickness_text)  # Main text
-            
-            # Confidence label
-            text_y += conf_height + 5
-            cv2.putText(annotated_image, confidence_label, (label_x + 5, text_y),
-                       font, font_scale-0.1, (200, 200, 200), thickness_text-1)
-            
-            # PPE status label
-            text_y += ppe_height + 5
-            cv2.putText(annotated_image, ppe_status, (label_x + 5, text_y),
-                       font, font_scale-0.1, (200, 200, 200), thickness_text-1)
+            cv2.putText(annotated_image, label, (label_x + 4, text_y),
+                       font, font_scale, (255, 255, 255), thickness_text)
         
         return annotated_image
     
