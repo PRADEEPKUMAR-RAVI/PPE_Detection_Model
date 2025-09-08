@@ -86,6 +86,7 @@ async def infer_video(
     save_outputs: bool = Query(True),
     output_dir: str = Query("outputs"),
     download_video: bool = Query(False, description="Return processed video file for download"),
+    frame_skip: Optional[int] = Query(None, ge=1, le=10, description="Process every Nth frame (auto if None)"),
     required_ppe: Optional[str] = Query(None, description="Comma-separated list of required PPE items (e.g., 'Helmet,Vest,Gloves')")
 ):
     """
@@ -117,7 +118,8 @@ async def infer_video(
                 iou_threshold=iou_threshold,
                 save_outputs=save_outputs,
                 output_dir=output_dir,
-                required_ppe=required_ppe_list
+                required_ppe=required_ppe_list,
+                manual_frame_skip=frame_skip
             )
             
             # Return video file for download if requested

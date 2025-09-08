@@ -45,6 +45,17 @@ class Track:
         self.first_frame = 0
         self.last_frame = 0
         
+        # Standing detection tracking
+        self.is_standing = initial_status.get('is_standing', False)
+        self.standing_confidence = initial_status.get('standing_confidence', 0.0)
+        self.standing_frames = 1 if self.is_standing else 0
+        self.total_standing_time = 0.0  # In seconds
+        self.current_standing_start = None  # Frame number when current standing session started
+        
+        # Initialize standing start if person is standing
+        if self.is_standing:
+            self.current_standing_start = 0  # Start counting from frame 0
+        
         # Motion prediction parameters
         self.velocity = [0, 0, 0, 0]  # dx, dy, dw, dh
         self.velocity_buffer = deque(maxlen=3)
@@ -114,7 +125,7 @@ class Track:
         except Exception as e:
             print(f"Prediction error for track {self.track_id}: {e}")
     
-    def update(self, new_bbox: List[float], detection: Dict, frame_number: int):
+    def update(self, new_bbox: List[float], detection: Dict, frame_number: int, fps: float = 30.0):
         """Update track with new detection."""
         self.bbox = new_bbox
         self.bbox_buffer.append(new_bbox)
@@ -142,6 +153,25 @@ class Track:
             self.safe_count += 1
         else:
             self.unsafe_count += 1
+        
+        # Update standing statistics
+        new_is_standing = detection.get('is_standing', False)
+        new_standing_confidence = detection.get('standing_confidence', 0.0)
+        
+        if new_is_standing:
+            self.standing_frames += 1
+            if not self.is_standing:  # Just started standing
+                self.current_standing_start = frame_number
+        else:
+            if self.is_standing and self.current_standing_start is not None:  # Just stopped standing
+                # Add to total standing time
+                frames_standing = frame_number - self.current_standing_start
+                time_standing = frames_standing / fps
+                self.total_standing_time += time_standing
+                self.current_standing_start = None
+        
+        self.is_standing = new_is_standing
+        self.standing_confidence = new_standing_confidence
         
         # State transitions
         if self.state == 'tentative' and self.hits >= 3:
@@ -180,6 +210,22 @@ class Track:
             return 0.0
         return (self.safe_count / self.total_appearances) * 100
     
+    def get_standing_percentage(self) -> float:
+        """Calculate standing percentage for this track."""
+        if self.total_appearances == 0:
+            return 0.0
+        return (self.standing_frames / self.total_appearances) * 100
+    
+    def finalize_standing_time(self, final_frame: int, fps: float = 30.0) -> float:
+        """Finalize standing time calculation when track ends."""
+        if self.is_standing and self.current_standing_start is not None:
+            # Add remaining standing time
+            frames_standing = final_frame - self.current_standing_start
+            time_standing = frames_standing / fps
+            self.total_standing_time += time_standing
+            self.current_standing_start = None
+        return self.total_standing_time
+    
     def to_dict(self, interpolated: bool = False) -> Dict:
         """Convert track to dictionary format."""
         return {
@@ -189,25 +235,31 @@ class Track:
             'status': self.status,
             'has_helmet': self.has_helmet,
             'has_vest': self.has_vest,
+            'ppe_detected': self.ppe_detected,  # This was missing!
             'interpolated': interpolated,
             'quality_score': self.get_quality_score(),
-            'total_appearances': self.total_appearances
+            'total_appearances': self.total_appearances,
+            'is_standing': self.is_standing,
+            'standing_confidence': self.standing_confidence,
+            'total_standing_time': self.total_standing_time,
+            'standing_percentage': self.get_standing_percentage()
         }
 
 
 class MultiObjectTracker:
     """Enhanced multi-object tracker with ByteTrack-style lifecycle management."""
     
-    def __init__(self, max_disappeared: int = 10, max_distance: float = 150):
+    def __init__(self, max_disappeared: int = 10, max_distance: float = 150, fps: float = 30.0):
         self.tracks = {}  # Dict of track_id -> Track
         self.next_id = 1
         self.max_disappeared = max_disappeared
         self.max_distance = max_distance
+        self.fps = fps  # Frames per second for time calculations
         
-        # Dynamic thresholds
-        self.high_iou_threshold = 0.3  # For confirmed tracks
-        self.low_iou_threshold = 0.2   # For tentative tracks
-        self.detection_threshold = 0.4  # High confidence detections (lowered from 0.6)
+        # Dynamic thresholds (lowered for better low-quality tracking)
+        self.high_iou_threshold = 0.25  # For confirmed tracks
+        self.low_iou_threshold = 0.15   # For tentative tracks
+        self.detection_threshold = 0.25  # High confidence detections (lowered for better low-quality detection)
         
     def cleanup_old_tracks(self):
         """Remove very old tracks to prevent memory buildup."""
@@ -276,7 +328,7 @@ class MultiObjectTracker:
             for det_idx, track_idx in matches:
                 track_id = track_ids[track_idx]
                 detection = high_conf_detections[det_idx]
-                self.tracks[track_id].update(detection['bbox'], detection, frame_number)
+                self.tracks[track_id].update(detection['bbox'], detection, frame_number, self.fps)
                 matched_track_ids.add(track_id)
                 matched_detection_indices.add(det_idx)
         
@@ -303,7 +355,7 @@ class MultiObjectTracker:
                 
                 track_id = track_ids[track_idx]
                 detection = remaining_high_conf[det_idx]
-                self.tracks[track_id].update(detection['bbox'], detection, frame_number)
+                self.tracks[track_id].update(detection['bbox'], detection, frame_number, self.fps)
                 matched_track_ids.add(track_id)
                 matched_detection_indices.add(original_det_idx)
         
@@ -334,7 +386,7 @@ class MultiObjectTracker:
             for det_idx, track_idx in matches:
                 track_id = track_ids[track_idx]
                 detection = low_conf_detections[det_idx]
-                self.tracks[track_id].update(detection['bbox'], detection, frame_number)
+                self.tracks[track_id].update(detection['bbox'], detection, frame_number, self.fps)
                 matched_track_ids.add(track_id)
         
         # Mark unmatched tracks as missed
@@ -430,6 +482,21 @@ class YOLOService:
         
         # Initialize tracker as None - will be created when needed for video
         self.tracker = None
+        
+        # Adaptive detection settings
+        self.adaptive_threshold_enabled = True
+        self.min_conf_threshold = 0.15  # Lower minimum for low-quality videos
+        self.max_conf_threshold = 0.35  # Higher maximum for high-quality videos
+        
+        # Performance optimization settings
+        self.max_video_duration = 600  # 10 minutes max processing time
+        self.frame_skip_threshold = 1800  # Skip frames if video > 30 fps * 60 seconds
+        self.adaptive_frame_skip = True
+        
+        # Standing detection settings
+        self.enable_standing_detection = True
+        self.standing_height_ratio_threshold = 1.2  # Height/width ratio for standing detection (lowered for better detection)
+        self.standing_area_threshold = 0.02  # Minimum area ratio of image for standing detection (lowered for distant people)
     
     def load_model(self, model_path: Optional[str] = None):
         """Load YOLOv8 model."""
@@ -457,6 +524,187 @@ class YOLOService:
         except Exception as e:
             print(f"Failed to load model: {e}")
             raise
+    
+    def _analyze_image_quality(self, image: np.ndarray) -> Dict[str, float]:
+        """Analyze image quality metrics to determine detection parameters."""
+        # Calculate Laplacian variance (sharpness/blur metric)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        
+        # Calculate brightness
+        brightness = np.mean(gray)
+        
+        # Calculate contrast (standard deviation)
+        contrast = np.std(gray)
+        
+        # Estimate noise level
+        noise = np.std(cv2.GaussianBlur(gray, (5, 5), 0) - gray)
+        
+        return {
+            'sharpness': laplacian_var,
+            'brightness': brightness,
+            'contrast': contrast,
+            'noise': noise
+        }
+    
+    def _get_adaptive_confidence_threshold(self, image_quality: Dict[str, float], base_threshold: float = 0.25) -> float:
+        """Calculate adaptive confidence threshold based on image quality."""
+        if not self.adaptive_threshold_enabled:
+            return base_threshold
+        
+        # Normalize quality metrics
+        sharpness_score = min(1.0, image_quality['sharpness'] / 100.0)  # Good sharpness > 100
+        brightness_score = 1.0 - abs(image_quality['brightness'] - 127.5) / 127.5  # Ideal brightness ~127.5
+        contrast_score = min(1.0, image_quality['contrast'] / 50.0)  # Good contrast > 50
+        noise_score = max(0.0, 1.0 - image_quality['noise'] / 10.0)  # Low noise < 10
+        
+        # Combine scores
+        quality_score = (sharpness_score + brightness_score + contrast_score + noise_score) / 4.0
+        
+        # Adjust threshold based on quality (lower quality = lower threshold)
+        if quality_score < 0.3:  # Very low quality
+            adaptive_threshold = self.min_conf_threshold
+        elif quality_score < 0.6:  # Low quality
+            adaptive_threshold = base_threshold * 0.7
+        elif quality_score > 0.8:  # High quality
+            adaptive_threshold = min(self.max_conf_threshold, base_threshold * 1.2)
+        else:  # Medium quality
+            adaptive_threshold = base_threshold
+        
+        return adaptive_threshold
+    
+    def _preprocess_for_detection(self, image: np.ndarray, quality_metrics: Dict[str, float], fast_mode: bool = False) -> np.ndarray:
+        """Apply preprocessing to improve detection on low-quality images."""
+        processed = image.copy()
+        
+        # Skip expensive operations in fast mode
+        if fast_mode:
+            # Only apply essential brightness correction
+            if quality_metrics.get('brightness', 127) < 80:
+                processed = cv2.convertScaleAbs(processed, alpha=1.3, beta=20)
+            elif quality_metrics.get('brightness', 127) > 180:
+                processed = cv2.convertScaleAbs(processed, alpha=0.8, beta=-10)
+            return processed
+        
+        # Apply CLAHE for low contrast images (faster version)
+        if quality_metrics.get('contrast', 50) < 25:
+            if len(processed.shape) == 3:
+                # Faster: apply only to grayscale
+                gray = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY)
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                enhanced_gray = clahe.apply(gray)
+                # Blend with original
+                processed = cv2.cvtColor(enhanced_gray, cv2.COLOR_GRAY2BGR)
+            else:
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                processed = clahe.apply(processed)
+        
+        # Skip expensive denoising in video processing
+        
+        # Apply light sharpening for very blurry images only
+        if quality_metrics.get('sharpness', 100) < 30:
+            kernel = np.array([[0, -1, 0],
+                              [-1, 5, -1],
+                              [0, -1, 0]])
+            processed = cv2.filter2D(processed, -1, kernel)
+        
+        # Fast brightness adjustment
+        brightness = quality_metrics.get('brightness', 127)
+        if brightness < 80:
+            processed = cv2.convertScaleAbs(processed, alpha=1.2, beta=15)
+        elif brightness > 180:
+            processed = cv2.convertScaleAbs(processed, alpha=0.9, beta=-5)
+        
+        return processed
+    
+    def _run_multiscale_detection(self, image: np.ndarray, conf_threshold: float, iou_threshold: float) -> List:
+        """Run detection at multiple scales to catch small/distant objects."""
+        all_results = []
+        
+        # Original scale
+        results_original = self.model(image, conf=conf_threshold, iou=iou_threshold, verbose=False)
+        all_results.extend(results_original)
+        
+        # Only do multiscale if image is large enough and we have low detections
+        if image.shape[0] > 640 or image.shape[1] > 640:
+            # Try at 1.2x scale (upscale for better small object detection)
+            height, width = image.shape[:2]
+            new_height, new_width = int(height * 1.2), int(width * 1.2)
+            
+            if new_height < 2000 and new_width < 2000:  # Avoid memory issues
+                upscaled = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+                results_upscaled = self.model(upscaled, conf=conf_threshold * 0.9, iou=iou_threshold, verbose=False)
+                
+                # Scale bounding boxes back to original size
+                for result in results_upscaled:
+                    if result.boxes is not None:
+                        result.boxes.xyxy /= 1.2  # Scale back coordinates
+                
+                all_results.extend(results_upscaled)
+        
+        return all_results
+    
+    def _calculate_optimal_frame_skip(self, total_frames: int, fps: int, duration_seconds: float) -> int:
+        """Calculate optimal frame skip based on video properties."""
+        if not self.adaptive_frame_skip:
+            return 1  # Process every frame
+            
+        # For very long videos, skip more frames
+        if duration_seconds > 300:  # > 5 minutes
+            return max(2, fps // 10)  # Process ~10 frames per second
+        elif duration_seconds > 120:  # > 2 minutes  
+            return max(1, fps // 15)  # Process ~15 frames per second
+        elif total_frames > self.frame_skip_threshold:
+            return max(1, fps // 20)  # Process ~20 frames per second
+        else:
+            return 1  # Process every frame for short videos
+    
+    def _detect_standing_posture(self, bbox: List[float], image_shape: Tuple[int, int]) -> Dict[str, Union[bool, float]]:
+        """Detect if a person is standing based on bounding box geometry."""
+        if not self.enable_standing_detection:
+            return {'is_standing': False, 'confidence': 0.0, 'height_ratio': 0.0}
+        
+        x1, y1, x2, y2 = bbox
+        width = x2 - x1
+        height = y2 - y1
+        
+        # Calculate height-to-width ratio
+        height_ratio = height / width if width > 0 else 0
+        
+        # Calculate bounding box area relative to image
+        bbox_area = width * height
+        image_area = image_shape[0] * image_shape[1]  # height * width
+        area_ratio = bbox_area / image_area if image_area > 0 else 0
+        
+        # Adjusted thresholds for better detection
+        # Lower the height ratio threshold for better detection
+        is_tall_enough = height_ratio >= 1.2  # Lowered from 1.5
+        # Lower the area threshold for smaller/distant people
+        is_large_enough = area_ratio >= 0.02  # Lowered from 0.1
+        
+        # Additional heuristics for better detection
+        # Person should be touching or near the bottom of the frame (standing on ground)
+        bottom_proximity = (image_shape[0] - y2) / image_shape[0]  # Distance from bottom
+        is_grounded = bottom_proximity < 0.5  # Within 50% of bottom (more lenient)
+        
+        # Standing confidence based on multiple factors
+        standing_confidence = 0.0
+        if is_tall_enough:
+            standing_confidence += 0.4
+        if is_large_enough:
+            standing_confidence += 0.3
+        if is_grounded:
+            standing_confidence += 0.3
+        
+        is_standing = standing_confidence >= 0.5  # Lowered threshold for better detection
+        
+        return {
+            'is_standing': is_standing,
+            'confidence': standing_confidence,
+            'height_ratio': height_ratio,
+            'area_ratio': area_ratio,
+            'bottom_proximity': bottom_proximity
+        }
     
     def _parse_detections(self, results, debug=False) -> Dict[str, List[Dict]]:
         """Parse YOLO results into categorized detections."""
@@ -520,7 +768,7 @@ class YOLOService:
         return detections_by_class
     
     def associate_ppe(self, detections_by_class: Dict[str, List[Dict]], 
-                     required_ppe: List[str] = None) -> List[Dict]:
+                     required_ppe: List[str] = None, image_shape: Tuple[int, int] = None) -> List[Dict]:
         """Associate PPE items with persons and determine safety compliance."""
         person_statuses = []
         persons = detections_by_class.get('Person', [])
@@ -554,6 +802,11 @@ class YOLOService:
                 all_required_present = all(ppe_detected.get(ppe, False) for ppe in required_ppe)
                 status = "Safe" if all_required_present else "Unsafe"
             
+            # Detect standing posture if image shape is provided
+            standing_info = {'is_standing': False, 'confidence': 0.0}
+            if image_shape is not None:
+                standing_info = self._detect_standing_posture(person_bbox, image_shape)
+            
             person_status = {
                 'bbox': person_bbox,
                 'confidence': person['confidence'],
@@ -561,7 +814,10 @@ class YOLOService:
                 'ppe_detected': ppe_detected,
                 # Keep backward compatibility
                 'has_helmet': ppe_detected.get('Helmet', False),
-                'has_vest': ppe_detected.get('Vest', False)
+                'has_vest': ppe_detected.get('Vest', False),
+                # Standing detection
+                'is_standing': standing_info['is_standing'],
+                'standing_confidence': standing_info['confidence']
             }
             
             person_statuses.append(person_status)
@@ -640,11 +896,14 @@ class YOLOService:
             confidence = person['confidence']
             status = person['status']
             
-            # Color based on safety status
-            if status == "Safe":
-                color = (0, 255, 0)  # Green for safe
+            # Color based on PPE safety status only
+            is_standing = person.get('is_standing', False)
+            
+            if status == "Safe" and not is_standing:
+                color = (0, 255, 0)  # Green for safe and not standing
                 bg_color = (0, 200, 0)
             else:
+                # Red for unsafe (either missing PPE or standing)
                 color = (0, 0, 255)  # Red for unsafe
                 bg_color = (0, 0, 200)
             
@@ -658,13 +917,17 @@ class YOLOService:
                 if ppe_detected.get(ppe, False):
                     detected_items.append(symbol)
             
-            # Create single simplified label with Person and PPE items
+            # Create single simplified label with Person, PPE items, and standing status
+            standing_indicator = ""
+            if person.get('is_standing', False):
+                standing_indicator = " [Standing]"
+            
             if detected_items:
-                label = f"Person: {','.join(detected_items)}"
+                label = f"Person: {','.join(detected_items)}{standing_indicator}"
             else:
                 # Show status if no specific PPE detected
                 status = person.get('status', 'Unknown')
-                label = f"Person ({status})"
+                label = f"Person ({status}){standing_indicator}"
             
             # Calculate text size for simplified label - make more readable
             font = cv2.FONT_HERSHEY_SIMPLEX
@@ -727,8 +990,11 @@ class YOLOService:
             status = person['status']
             is_interpolated = person.get('interpolated', False)
             
-            # Color based on safety status with different shades for interpolated
-            if status == "Safe":
+            # Color based on PPE safety status only, with interpolation shading
+            is_standing = person.get('is_standing', False)
+            
+            if status == "Safe" and not is_standing:
+                # Green only for safe and not standing
                 if is_interpolated:
                     color = (0, 180, 0)  # Darker green for interpolated
                     bg_color = (0, 150, 0)
@@ -736,6 +1002,7 @@ class YOLOService:
                     color = (0, 255, 0)  # Bright green for detected
                     bg_color = (0, 200, 0)
             else:
+                # Red for unsafe (either missing PPE or standing)
                 if is_interpolated:
                     color = (0, 0, 180)  # Darker red for interpolated
                     bg_color = (0, 0, 150)
@@ -755,13 +1022,18 @@ class YOLOService:
                 if ppe_detected.get(ppe, False):
                     detected_items.append(symbol)
             
-            # Create single simplified label with Person and PPE items
+            # Create single simplified label with Person, PPE items, and standing status
+            standing_indicator = ""
+            if person.get('is_standing', False):
+                standing_time = person.get('total_standing_time', 0)
+                standing_indicator = f" [Standing:{standing_time:.1f}s]"
+            
             if detected_items:
-                label = f"Person: {','.join(detected_items)}"
+                label = f"Person: {','.join(detected_items)}{standing_indicator}"
             else:
                 # Show status if no specific PPE detected
                 status = person.get('status', 'Unknown')
-                label = f"Person ({status})"
+                label = f"Person ({status}){standing_indicator}"
             
             # Calculate text size for simplified label
             font = cv2.FONT_HERSHEY_SIMPLEX
@@ -805,14 +1077,27 @@ class YOLOService:
         image_pil = Image.open(io.BytesIO(image_bytes))
         image_np = np.array(image_pil)
         
-        # Run YOLO inference
-        results = self.model(image_np, conf=conf_threshold, iou=iou_threshold, verbose=False)
+        # Analyze image quality and adjust parameters
+        quality_metrics = self._analyze_image_quality(image_np)
+        adaptive_conf = self._get_adaptive_confidence_threshold(quality_metrics, conf_threshold)
+        
+        # Preprocess image if low quality
+        preprocessed_image = self._preprocess_for_detection(image_np, quality_metrics)
+        
+        # Run YOLO inference with adaptive parameters
+        results = self.model(preprocessed_image, conf=adaptive_conf, iou=iou_threshold, verbose=False)
+        
+        # If very few detections and low quality, try multiscale detection
+        initial_detections = sum(len(result.boxes) if result.boxes is not None else 0 for result in results)
+        if initial_detections < 2 and quality_metrics['sharpness'] < 100:
+            print(f"Low detections ({initial_detections}) detected, trying multiscale detection...")
+            results = self._run_multiscale_detection(preprocessed_image, adaptive_conf, iou_threshold)
         
         # Parse detections
         detections_by_class = self._parse_detections(results)
         
-        # Associate PPE with persons
-        person_statuses = self.associate_ppe(detections_by_class, required_ppe)
+        # Associate PPE with persons (include image shape for standing detection)
+        person_statuses = self.associate_ppe(detections_by_class, required_ppe, preprocessed_image.shape[:2])
         
         # Draw annotations
         annotated_image = self._draw_annotations(image_np, person_statuses, detections_by_class)
@@ -831,13 +1116,16 @@ class YOLOService:
             annotated_pil.save(output_path)
         
         # Prepare response JSON
+        standing_count = sum(1 for p in person_statuses if p.get('is_standing', False))
+        
         response_json = {
             "source": "image",
             "people": person_statuses,
             "counts": {
                 "safe": sum(1 for p in person_statuses if p['status'] == 'Safe'),
                 "unsafe": sum(1 for p in person_statuses if p['status'] == 'Unsafe'),
-                "total": len(person_statuses)
+                "total": len(person_statuses),
+                "standing": standing_count
             }
         }
         
@@ -852,7 +1140,8 @@ class YOLOService:
                    iou_threshold: float = 0.45,
                    save_outputs: bool = True,
                    output_dir: str = "outputs",
-                   required_ppe: List[str] = None) -> Tuple[Optional[str], Dict]:
+                   required_ppe: List[str] = None,
+                   manual_frame_skip: Optional[int] = None) -> Tuple[Optional[str], Dict]:
         """
         Run inference on video and return output video path and results.
         Enhanced with better frame processing and statistics.
@@ -867,8 +1156,24 @@ class YOLOService:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration_seconds = total_frames / fps if fps > 0 else 0
         
-        print(f"Video properties: {width}x{height}, {fps} FPS, {total_frames} frames")
+        print(f"DEBUG: Video FPS detected: {fps}")  # Debug FPS
+        
+        # Calculate optimal frame skip for performance
+        if manual_frame_skip is not None:
+            frame_skip = manual_frame_skip
+            print(f"Using manual frame skip: {frame_skip}")
+        else:
+            frame_skip = self._calculate_optimal_frame_skip(total_frames, fps, duration_seconds)
+        
+        print(f"Video properties: {width}x{height}, {fps} FPS, {total_frames} frames, {duration_seconds:.1f}s")
+        print(f"Frame skip: {frame_skip} (processing every {frame_skip} frame{'s' if frame_skip > 1 else ''})")
+        
+        # Check if video is too long and warn
+        if duration_seconds > self.max_video_duration:
+            print(f"WARNING: Video duration ({duration_seconds:.1f}s) exceeds recommended maximum ({self.max_video_duration}s)")
+            print(f"Consider using frame_skip={max(frame_skip, fps//5)} for faster processing")
         
         # Setup output video if saving
         output_path = None
@@ -885,15 +1190,19 @@ class YOLOService:
         
         # Use existing tracker or create new one if not exists (maintain continuity)
         if not hasattr(self, 'tracker') or self.tracker is None:
-            self.tracker = MultiObjectTracker(max_disappeared=10, max_distance=150)
+            self.tracker = MultiObjectTracker(max_disappeared=10, max_distance=150, fps=fps)
+        else:
+            # Update existing tracker's fps to match current video
+            self.tracker.fps = fps
         # Optional: Clear very old tracks to prevent memory issues
         self.tracker.cleanup_old_tracks()
         frame_stats = []
         frame_count = 0
         processed_frames = 0
-        # NO FRAME SKIPPING - process every frame for stable tracking
+        last_tracked_people = []  # Store last processed tracking results for skipped frames
+        last_detections_by_class = {}  # Store last detections for skipped frames
         
-        print(f"Processing ALL frames for maximum tracking stability ({fps} FPS)")
+        print(f"Processing frames with skip={frame_skip} for optimal performance ({fps} FPS)")
         
         while True:
             ret, frame = cap.read()
@@ -901,11 +1210,53 @@ class YOLOService:
                 break
             
             frame_count += 1
-            # Process EVERY frame - no skipping
+            
+            # Skip frames based on calculated skip rate
+            if frame_skip > 1 and (frame_count - 1) % frame_skip != 0:
+                # Apply last known annotations to skipped frame to prevent blinking
+                if out is not None:
+                    if last_tracked_people:  # Use last known tracking results
+                        skipped_frame = self._draw_video_annotations(
+                            frame, last_tracked_people, frame_count, total_frames, last_detections_by_class
+                        )
+                        out.write(skipped_frame)
+                    else:
+                        out.write(frame)  # First few frames before any tracking
+                continue
             
             try:
+                # Analyze frame quality less frequently for long videos
+                analysis_interval = 30 if duration_seconds > 120 else 10
+                if processed_frames % analysis_interval == 0:  # Analyze quality periodically
+                    self.current_quality_metrics = self._analyze_image_quality(frame)
+                    self.current_adaptive_conf = self._get_adaptive_confidence_threshold(
+                        self.current_quality_metrics, conf_threshold
+                    )
+                    
+                    # Log quality info for debugging
+                    if processed_frames <= 3 or processed_frames % 100 == 0:
+                        quality_score = (
+                            min(1.0, self.current_quality_metrics['sharpness'] / 100.0) +
+                            min(1.0, self.current_quality_metrics['contrast'] / 50.0)
+                        ) / 2.0
+                        progress = (frame_count / total_frames) * 100 if total_frames > 0 else 0
+                        print(f"Frame {frame_count} ({progress:.1f}%): Quality score: {quality_score:.2f}, "
+                              f"Adaptive conf: {self.current_adaptive_conf:.3f}")
+                
+                # Use cached values if available
+                adaptive_conf = getattr(self, 'current_adaptive_conf', conf_threshold)
+                quality_metrics = getattr(self, 'current_quality_metrics', {})
+                
+                # Fast preprocessing for videos (only essential corrections)
+                if quality_metrics and (quality_metrics.get('sharpness', 100) < 40 or 
+                                       quality_metrics.get('brightness', 127) < 70 or
+                                       quality_metrics.get('brightness', 127) > 200):
+                    processed_frame = self._preprocess_for_detection(frame, quality_metrics, fast_mode=True)
+                else:
+                    processed_frame = frame
+                
                 # Run inference on frame
-                results = self.model(frame, conf=conf_threshold, iou=iou_threshold, verbose=False)
+                results = self.model(processed_frame, conf=adaptive_conf, iou=iou_threshold, verbose=False)
                 
                 # Parse detections with debug info on first few frames
                 debug_this_frame = frame_count <= 3 or frame_count % 30 == 0
@@ -916,8 +1267,13 @@ class YOLOService:
                     persons_count = len(detections_by_class.get('Person', []))
                     print(f"Frame {frame_count}: Found {persons_count} persons")
                 
-                # Associate PPE with persons
-                person_statuses = self.associate_ppe(detections_by_class, required_ppe)
+                # Associate PPE with persons (include frame shape for standing detection)
+                person_statuses = self.associate_ppe(detections_by_class, required_ppe, processed_frame.shape[:2])
+                
+                # Debug: Log standing detection
+                standing_people = [p for p in person_statuses if p.get('is_standing', False)]
+                if standing_people and frame_count % 30 == 0:
+                    print(f"DEBUG: Frame {frame_count}: Found {len(standing_people)} standing people")
                 
                 # Debug: Log person statuses
                 if frame_count % 30 == 0 and person_statuses:
@@ -937,6 +1293,10 @@ class YOLOService:
                 # Draw annotations with frame info using tracked people
                 annotated_frame = self._draw_video_annotations(frame, tracked_people, frame_count, total_frames, detections_by_class)
                 
+                # Store results for skipped frame annotations (prevent blinking)
+                last_tracked_people = tracked_people.copy()
+                last_detections_by_class = detections_by_class.copy() if detections_by_class else {}
+                
                 # Track frame statistics 
                 current_people_count = len([p for p in tracked_people if not p.get('interpolated', False)])
                 frame_stat = {
@@ -953,10 +1313,15 @@ class YOLOService:
                 
                 processed_frames += 1
                 
-                # Progress feedback for long videos
-                if frame_count % (fps * 10) == 0:  # Every 10 seconds
+                # Progress feedback for long videos - more frequent for long videos
+                progress_interval = max(fps * 5, 150) if duration_seconds > 60 else fps * 10  # Every 5 seconds for long videos
+                if frame_count % progress_interval == 0:
                     progress = (frame_count / total_frames) * 100 if total_frames > 0 else 0
-                    print(f"Processed {frame_count}/{total_frames} frames ({progress:.1f}%)")
+                    processing_speed = processed_frames / max(1, frame_count - 1) if frame_count > 1 else 1.0
+                    est_remaining = (total_frames - frame_count) / (processing_speed * fps) if processing_speed > 0 and fps > 0 else 0
+                    print(f"Progress: {frame_count}/{total_frames} frames ({progress:.1f}%) - "
+                          f"Processing speed: {processing_speed:.2f}x - "
+                          f"Est. remaining: {est_remaining:.1f}s")
                     
             except Exception as frame_error:
                 print(f"Error processing frame {frame_count}: {frame_error}")
@@ -982,19 +1347,25 @@ class YOLOService:
         for track_id, track in self.tracker.tracks.items():
             print(f"Track {track_id}: {track.total_appearances} appearances, state: {track.state}")
         
-        # Get final tracked people from the tracker
-        final_tracked_people = [
-            track for track in self.tracker.tracks.values() 
-            if track.total_appearances >= min_appearances
-        ]
+        # Get final tracked people from the tracker and finalize standing times
+        final_tracked_people = []
+        for track in self.tracker.tracks.values():
+            if track.total_appearances >= min_appearances:
+                # Finalize standing time for each track
+                final_time = track.finalize_standing_time(frame_count, fps)
+                print(f"DEBUG: Track {track.track_id} finalized with {final_time:.2f}s standing time (FPS: {fps})")
+                final_tracked_people.append(track)
         
         # Fallback: If no tracks meet threshold, include all confirmed tracks
         if len(final_tracked_people) == 0 and len(self.tracker.tracks) > 0:
             print("No tracks met minimum appearances threshold, using all confirmed tracks")
-            final_tracked_people = [
-                track for track in self.tracker.tracks.values() 
-                if track.state == 'confirmed' or track.total_appearances >= 1
-            ]
+            final_tracked_people = []
+            for track in self.tracker.tracks.values():
+                if track.state == 'confirmed' or track.total_appearances >= 1:
+                    # Finalize standing time for each track
+                    final_time = track.finalize_standing_time(frame_count, fps)
+                    print(f"DEBUG: Fallback track {track.track_id} finalized with {final_time:.2f}s standing time (FPS: {fps})")
+                    final_tracked_people.append(track)
         
         print(f"ByteTracker found {len(final_tracked_people)} stable tracks across all frames")
         
@@ -1016,6 +1387,12 @@ class YOLOService:
                     'safety_percentage': track.get_safety_percentage(),
                     'first_seen_frame': track.first_frame,
                     'last_seen_frame': track.last_frame
+                },
+                'standing_stats': {
+                    'is_standing': track.is_standing,
+                    'total_standing_time': round(track.total_standing_time, 2),
+                    'standing_percentage': round(track.get_standing_percentage(), 1),
+                    'standing_confidence': track.standing_confidence
                 }
             }
             final_people.append(person)
@@ -1029,6 +1406,12 @@ class YOLOService:
         avg_people_per_frame = sum(stat['people_count'] for stat in frame_stats) / max(1, len(frame_stats))
         max_people_in_frame = max((stat['people_count'] for stat in frame_stats), default=0)
         safety_rate = (total_safe / max(1, total_unique_people)) * 100
+        
+        # Calculate standing statistics
+        total_standing_people = sum(1 for p in final_people if p['standing_stats']['total_standing_time'] > 0)
+        avg_standing_time = sum(p['standing_stats']['total_standing_time'] for p in final_people) / max(1, total_unique_people)
+        max_standing_time = max((p['standing_stats']['total_standing_time'] for p in final_people), default=0)
+        avg_standing_percentage = sum(p['standing_stats']['standing_percentage'] for p in final_people) / max(1, total_unique_people)
         
         response_json = {
             "source": "video",
@@ -1053,7 +1436,14 @@ class YOLOService:
                 "safety_compliance_rate": round(safety_rate, 1),
                 "frames_with_detections": len([s for s in frame_stats if s['people_count'] > 0]),
                 "processing_efficiency": round((processed_frames / frame_count) * 100, 1),
-                "tracking_threshold": min_appearances
+                "tracking_threshold": min_appearances,
+                "standing_analytics": {
+                    "people_who_stood": total_standing_people,
+                    "average_standing_time": round(avg_standing_time, 2),
+                    "max_standing_time": round(max_standing_time, 2),
+                    "average_standing_percentage": round(avg_standing_percentage, 1),
+                    "standing_detection_enabled": self.enable_standing_detection
+                }
             }
         }
         
@@ -1066,26 +1456,36 @@ class YOLOService:
         """
         Run inference on a single frame (for webcam streaming).
         """
-        # Run YOLO inference
-        results = self.model(frame, conf=conf_threshold, iou=iou_threshold, verbose=False)
+        # Analyze frame quality and adapt parameters
+        quality_metrics = self._analyze_image_quality(frame)
+        adaptive_conf = self._get_adaptive_confidence_threshold(quality_metrics, conf_threshold)
+        
+        # Preprocess frame if needed
+        processed_frame = self._preprocess_for_detection(frame, quality_metrics)
+        
+        # Run YOLO inference with adaptive parameters
+        results = self.model(processed_frame, conf=adaptive_conf, iou=iou_threshold, verbose=False)
         
         # Parse detections
         detections_by_class = self._parse_detections(results)
         
-        # Associate PPE with persons
-        person_statuses = self.associate_ppe(detections_by_class, required_ppe)
+        # Associate PPE with persons (include frame shape for standing detection)
+        person_statuses = self.associate_ppe(detections_by_class, required_ppe, processed_frame.shape[:2])
         
         # Draw annotations
         annotated_frame = self._draw_annotations(frame, person_statuses, detections_by_class)
         
         # Prepare response JSON
+        standing_count = sum(1 for p in person_statuses if p.get('is_standing', False))
+        
         response_json = {
             "source": "webcam",
             "people": person_statuses,
             "counts": {
                 "safe": sum(1 for p in person_statuses if p['status'] == 'Safe'),
                 "unsafe": sum(1 for p in person_statuses if p['status'] == 'Unsafe'),
-                "total": len(person_statuses)
+                "total": len(person_statuses),
+                "standing": standing_count
             }
         }
         
